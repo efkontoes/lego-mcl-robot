@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "legobot"
+version = "1.0.0"
+description = "Monte Carlo Localisation, vision and DWA navigation for a BrickPi3 LEGO robot, with a simulator and a particle-filter noise study"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = ["numpy>=1.20", "matplotlib>=3.4", "pyyaml>=5.4"]
+
+[project.optional-dependencies]
+vision = ["opencv-python-headless>=4.5"]
+hw = ["opencv-python-headless>=4.5", "spidev", "picamera2"]
+dev = ["pytest>=7", "ruff>=0.4", "opencv-python-headless>=4.5", "pillow"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py39"
+extend-exclude = ["src/legobot/hardware/vendor"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["UP006", "UP007", "UP035", "UP045"]

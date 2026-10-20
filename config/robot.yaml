@@ -1,0 +1,125 @@
+# Single source of truth for every parameter used by the robot, the
+# localisation stack, the vision pipeline, the planner and the simulator.
+# Units: centimetres, seconds, radians (unless the key name says otherwise).
+
+robot:
+  wheels: small                 # which entry of wheel_profiles is mounted
+  wheel_profiles:
+    small: {degrees_per_cm: 20.73, velocity_cm_s: 9.17}
+    large: {degrees_per_cm: 16.39, velocity_cm_s: 11.9}
+  wheel_base_cm: 15.25          # distance between the wheel contact points
+  radius_cm: 7.5                # footprint radius (collision checks, bumpers)
+  drive_dps: 200                # wheel speed used for timed straight/turn motions
+  motor_power_limit: 70         # BrickPi power limit (%) for timed motions
+  # Empirical corrections for the real motors (BrickPi backend only):
+  turn_offset_s: 0.0725         # motor spin-up time added to every turn
+  forward_factor: 0.97          # straight runs overshoot by ~3% after stopping
+
+ports:
+  # If the robot turns the wrong way on hardware, swap left/right motor here.
+  left_motor: A
+  right_motor: C
+  sonar: 4
+  left_touch: 1
+  right_touch: 2
+
+sonar:
+  offset_cm: 7.0                # sensor face is this far ahead of the robot centre
+  sigma_cm: 1.5                 # measured noise at 20-100 cm (sonar calibration)
+  min_valid_cm: 20              # readings outside [min, max] are not trusted
+  max_valid_cm: 140
+  robust_constant: 0.001        # floor added to the likelihood (garbage readings)
+  max_raw_cm: 255               # value the NXT sonar reports when it sees nothing
+
+mcl:
+  num_particles: 100
+  # V0: the original coursework motion model (standard deviations per 10 cm move,
+  # and a fixed standard deviation per turn regardless of the angle).
+  coursework_model: {sigma_e: 0.3, sigma_f: 0.01, sigma_g: 0.02}
+  # V1: Probabilistic Robotics odometry model (Thrun et al. 2005, Table 5.6).
+  #   a1: rotation noise from rotation    [rad^2 / rad^2]
+  #   a2: rotation noise from translation [rad^2 / cm^2]
+  #   a3: translation noise from translation [cm^2 / cm^2]
+  #   a4: translation noise from rotation [cm^2 / rad^2]
+  # Fitted so that a 10 cm move / 90 deg turn matches the coursework sigmas.
+  odometry_alphas: {a1: 0.00016, a2: 0.000001, a3: 0.0009, a4: 0.01}
+  ess_threshold: 0.5            # V2: resample only if N_eff < threshold * N
+  augmented:                    # V3: augmented MCL random-particle injection
+    alpha_slow: 0.01            # long-term likelihood average rate
+    alpha_fast: 0.1             # short-term likelihood average rate
+    # Inject with p = max(0, 1 - w_fast / (ratio_threshold * w_slow)).
+    # 1.0 is the textbook rule; lower values ignore the normal step-to-step
+    # fluctuation of a single sonar beam's likelihood.
+    ratio_threshold: 0.5
+  cluster_radius_cm: 25.0       # pose estimate = weighted mean of particles near the weighted median
+  kld:                          # V4: KLD-sampling (Fox 2003)
+    epsilon: 0.05
+    z_quantile: 2.326           # upper 1 - delta quantile, delta = 0.01
+    bin_xy_cm: 5.0
+    bin_theta_deg: 15.0
+    n_min: 50
+    n_max: 1000
+
+behaviours:
+  square_side_cm: 40
+  bumper_reverse_cm: 10
+  bumper_step_cm: 10
+  wall_follow_target_cm: 30
+  wall_follow_kp: 10            # dps per cm of distance error
+  wall_follow_window: 5         # moving-average length (readings)
+  wall_follow_period_s: 0.5
+
+navigation:
+  start: [84, 30, 0.0]
+  waypoints: [[180, 30], [180, 54], [138, 54], [138, 168], [114, 168], [114, 84], [84, 84], [84, 30]]
+  dist_tol_cm: 3.0
+  ang_tol_rad: 0.2
+  max_step_cm: 20.0
+  settle_s: 0.5                 # pause before reading the sonar
+  sweep_steps: 12               # relocalisation sweep: turn 360 deg in this many steps
+
+camera:
+  width: 640
+  height: 480
+  # Ground-plane correspondences: [x_cm, y_cm, u_px, v_px] (robot frame, x forward, y left)
+  homography_points:
+    - [80, 20, 152, 65]
+    - [80, -20, 530, 76]
+    - [20, 10, 122, 336]
+    - [20, -10, 550, 346]
+  red_hsv_ranges:               # red wraps around hue 0 so it needs two ranges
+    - [[0, 50, 50], [10, 255, 255]]
+    - [[170, 50, 50], [180, 255, 255]]
+  min_blob_area_px: 150
+
+dwa:
+  max_dps: 600
+  motor_power_limit: 85
+  max_accel_cm_s2: 60
+  obstacle_radius_cm: 3.0
+  safe_dist_cm: 15.0
+  tau_s: 2.0                    # look-ahead horizon
+  dt_s: 0.1                     # control period
+  v_samples: 13                 # per wheel -> 169 candidate pairs
+  sim_steps: 6
+  weights: {forward: 2.0, obstacle: 2.0, reverse: 0.3, stagnation: 0.05}
+  stagnation_speed_cm_s: 10.0
+  goal_cm: [350, 0]
+  finish_x_cm: 300
+  min_obstacle_cm: 10
+  max_obstacle_cm: 150
+
+simulation:
+  # "True" noise of the simulated robot, set from the practical 1 calibration
+  # (0.3 cm and 0.01 rad per 10 cm driven, 0.02 rad per 90 deg turn) plus a
+  # small constant per turn that no filter models. The filters never read
+  # these values; they use their own motion models above.
+  trans_std_per_cm: 0.03
+  drift_std_per_cm: 0.001        # heading drift while driving straight
+  rot_std_per_rad: 0.0127
+  rot_std_const: 0.002
+  sonar_outlier_prob: 0.03
+  sonar_max_incidence_deg: 40    # beyond this the echo is usually lost
+  sonar_lost_prob: 0.7
+  camera_fov_deg: 50
+  can_height_cm: 11.0
