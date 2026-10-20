@@ -1,0 +1,41 @@
+{
+  "study_version": "2.0.0",
+  "batch": "noise",
+  "command": "python.exe run_study.py all",
+  "started_utc": "2026-10-20T12:27:08Z",
+  "git": {
+    "commit": "df03434ebad8c1d58ad86a41ecfaf1a68b586342",
+    "dirty": "yes"
+  },
+  "environment": {
+    "python": "3.14.2",
+    "numpy": "2.5.4",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "Intel64 Family 6 Model 142 Stepping 12, GenuineIntel",
+    "machine": "AMD64",
+    "cpu_count": "8"
+  },
+  "config_path": "robot.yaml",
+  "config_sha256": "796e16bbbac73a2c07caf99a0033676e437eccb473b0e37dc920bab7230a1d47",
+  "config_yaml": "# Single source of truth for every parameter used by the robot, the\n# localisation stack, the vision pipeline, the planner and the simulator.\n# Units: centimetres, seconds, radians (unless the key name says otherwise).\n\nrobot:\n  wheels: small                 # which entry of wheel_profiles is mounted\n  wheel_profiles:\n    small: {degrees_per_cm: 20.73, velocity_cm_s: 9.17}\n    large: {degrees_per_cm: 16.39, velocity_cm_s: 11.9}\n  wheel_base_cm: 15.25          # distance between the wheel contact points\n  radius_cm: 7.5                # footprint radius (collision checks, bumpers)\n  drive_dps: 200                # wheel speed used for timed straight/turn motions\n  motor_power_limit: 70         # BrickPi power limit (%) for timed motions\n  # Empirical corrections for the real motors (BrickPi backend only):\n  turn_offset_s: 0.0725         # motor spin-up time added to every turn\n  forward_factor: 0.97          # straight runs overshoot by ~3% after stopping\n\nports:\n  # If the robot turns the wrong way on hardware, swap left/right motor here.\n  left_motor: A\n  right_motor: C\n  sonar: 4\n  left_touch: 1\n  right_touch: 2\n\nsonar:\n  offset_cm: 7.0                # sensor face is this far ahead of the robot centre\n  sigma_cm: 1.5                 # measured noise at 20-100 cm (sonar calibration)\n  min_valid_cm: 20              # readings outside [min, max] are not trusted\n  max_valid_cm: 140\n  robust_constant: 0.001        # floor added to the likelihood (garbage readings)\n  max_raw_cm: 255               # value the NXT sonar reports when it sees nothing\n\nmcl:\n  num_particles: 100\n  # V0: the original coursework motion model (standard deviations per 10 cm move,\n  # and a fixed standard deviation per turn regardless of the angle).\n  coursework_model: {sigma_e: 0.3, sigma_f: 0.01, sigma_g: 0.02}\n  # V1: Probabilistic Robotics odometry model (Thrun et al. 2005, Table 5.6).\n  #   a1: rotation noise from rotation    [rad^2 / rad^2]\n  #   a2: rotation noise from translation [rad^2 / cm^2]\n  #   a3: translation noise from translation [cm^2 / cm^2]\n  #   a4: translation noise from rotation [cm^2 / rad^2]\n  # Fitted so that a 10 cm move / 90 deg turn matches the coursework sigmas.\n  odometry_alphas: {a1: 0.00016, a2: 0.000001, a3: 0.0009, a4: 0.01}\n  ess_threshold: 0.5            # V2: resample only if N_eff < threshold * N\n  augmented:                    # V3: augmented MCL random-particle injection\n    alpha_slow: 0.01            # long-term likelihood average rate\n    alpha_fast: 0.1             # short-term likelihood average rate\n    # Inject with p = max(0, 1 - w_fast / (ratio_threshold * w_slow)).\n    # 1.0 is the textbook rule; lower values ignore the normal step-to-step\n    # fluctuation of a single sonar beam's likelihood.\n    ratio_threshold: 0.5\n  cluster_radius_cm: 25.0       # pose estimate = weighted mean of particles near the weighted median\n  kld:                          # V4: KLD-sampling (Fox 2003)\n    epsilon: 0.05\n    z_quantile: 2.326           # upper 1 - delta quantile, delta = 0.01\n    bin_xy_cm: 5.0\n    bin_theta_deg: 15.0\n    n_min: 50\n    n_max: 1000\n\nbehaviours:\n  square_side_cm: 40\n  bumper_reverse_cm: 10\n  bumper_step_cm: 10\n  wall_follow_target_cm: 30\n  wall_follow_kp: 10            # dps per cm of distance error\n  wall_follow_window: 5         # moving-average length (readings)\n  wall_follow_period_s: 0.5\n\nnavigation:\n  start: [84, 30, 0.0]\n  waypoints: [[180, 30], [180, 54], [138, 54], [138, 168], [114, 168], [114, 84], [84, 84], [84, 30]]\n  dist_tol_cm: 3.0\n  ang_tol_rad: 0.2\n  max_step_cm: 20.0\n  settle_s: 0.5                 # pause before reading the sonar\n  sweep_steps: 12               # relocalisation sweep: turn 360 deg in this many steps\n\ncamera:\n  width: 640\n  height: 480\n  # Ground-plane correspondences: [x_cm, y_cm, u_px, v_px] (robot frame, x forward, y left)\n  homography_points:\n    - [80, 20, 152, 65]\n    - [80, -20, 530, 76]\n    - [20, 10, 122, 336]\n    - [20, -10, 550, 346]\n  red_hsv_ranges:               # red wraps around hue 0 so it needs two ranges\n    - [[0, 50, 50], [10, 255, 255]]\n    - [[170, 50, 50], [180, 255, 255]]\n  min_blob_area_px: 150\n\ndwa:\n  max_dps: 600\n  motor_power_limit: 85\n  max_accel_cm_s2: 60\n  obstacle_radius_cm: 3.0\n  safe_dist_cm: 15.0\n  tau_s: 2.0                    # look-ahead horizon\n  dt_s: 0.1                     # control period\n  v_samples: 13                 # per wheel -> 169 candidate pairs\n  sim_steps: 6\n  weights: {forward: 2.0, obstacle: 2.0, reverse: 0.3, stagnation: 0.05}\n  stagnation_speed_cm_s: 10.0\n  goal_cm: [350, 0]\n  finish_x_cm: 300\n  min_obstacle_cm: 10\n  max_obstacle_cm: 150\n\nsimulation:\n  # \"True\" noise of the simulated robot, set from the practical 1 calibration\n  # (0.3 cm and 0.01 rad per 10 cm driven, 0.02 rad per 90 deg turn) plus a\n  # small constant per turn that no filter models. The filters never read\n  # these values; they use their own motion models above.\n  trans_std_per_cm: 0.03\n  drift_std_per_cm: 0.001        # heading drift while driving straight\n  rot_std_per_rad: 0.0127\n  rot_std_const: 0.002\n  sonar_outlier_prob: 0.03\n  sonar_max_incidence_deg: 40    # beyond this the echo is usually lost\n  sonar_lost_prob: 0.7\n  camera_fov_deg: 50\n  can_height_cm: 11.0\n",
+  "seeds": [
+    2000,
+    2029
+  ],
+  "variants": [
+    "V1",
+    "V2",
+    "V5",
+    "V8"
+  ],
+  "motion_scales": [
+    0.5,
+    1.0,
+    2.0
+  ],
+  "outlier_probs": [
+    0.0,
+    0.03,
+    0.1
+  ]
+}

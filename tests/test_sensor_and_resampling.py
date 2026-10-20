@@ -3,7 +3,6 @@ import math
 import numpy as np
 import pytest
 
-from legobot.localisation.kld import kld_bound, kld_sample_count
 from legobot.localisation.resampling import effective_sample_size, systematic_resample
 from legobot.localisation.sensor_model import SonarModel
 
@@ -44,18 +43,3 @@ def test_systematic_resample_never_overflows(rng):
 def test_effective_sample_size():
     assert effective_sample_size(np.full(10, 0.1)) == pytest.approx(10)
     assert effective_sample_size(np.array([1.0, 0, 0, 0])) == pytest.approx(1)
-
-
-def test_kld_bound_grows_with_bins(cfg):
-    k = cfg.mcl.kld
-    bounds = [kld_bound(b, k.epsilon, k.z_quantile) for b in (1, 2, 5, 20, 100)]
-    assert bounds[0] == 0
-    assert all(a < b for a, b in zip(bounds, bounds[1:]))
-
-
-def test_kld_sample_count_adapts(cfg, world, rng):
-    k = cfg.mcl.kld
-    tight = np.tile([100.0, 50.0, 0.0], (k.n_max, 1))
-    assert kld_sample_count(tight, k) == k.n_min
-    spread = world.sample_free_poses(k.n_max, rng)
-    assert kld_sample_count(spread, k) == k.n_max

@@ -1,0 +1,9 @@
+{
+  "generated_by": "analyze.py",
+  "inputs": "results/raw",
+  "n_boot": 10000,
+  "git": {
+    "commit": "df03434ebad8c1d58ad86a41ecfaf1a68b586342",
+    "dirty": "yes"
+  }
+}

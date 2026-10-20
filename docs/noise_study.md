@@ -1,289 +1,562 @@
-# Noise study: fixing particle-cloud blow-up and depletion in MCL
+# Particle-filter noise management on a single-sonar LEGO robot
 
-This study started from a bug in the original coursework. Our waypoint-navigation
-script made the particle cloud spread wider and wider until localisation was useless.
-That raised the question of how well-known particle-filter implementations keep their
-noise under control. The study reimplements four techniques from the literature, in the
-form ROS AMCL and PythonRobotics use them. It then compares them on the coursework robot
-in simulation: 3 scenarios × 7 filter variants × 30 seeds.
+**Study version 2.0** (simulation only). The earlier exploratory study (v1) is preserved
+unchanged in [`experiments/noise_study/legacy_v1/`](../experiments/noise_study/legacy_v1/).
 
-Reproduce everything with:
+**Research question.** Under what conditions do adaptive particle-filter techniques
+(ESS-gated resampling, augmented-MCL particle injection and KLD-sampling) improve
+localisation accuracy and recovery? And how do their interactions affect computation and
+closed-loop navigation reliability?
 
-```bash
-python experiments/noise_study/run_benchmark.py   # ~40 s, writes results/*.csv
-python experiments/noise_study/make_figures.py    # figures + results/summary.md
-```
+**How to read this report.**
+- Every number below comes from the saved results in `experiments/noise_study/results/`.
+- [`results/analysis/summary.md`](../experiments/noise_study/results/analysis/summary.md)
+  holds the full tables, with 95% intervals.
+- The protocol was written down before the evaluation runs, in
+  [`PROTOCOL.md`](../experiments/noise_study/PROTOCOL.md).
+- Analyses added after seeing the results are labelled **exploratory**.
+- Nothing here has been validated on the physical robot.
 
-## 1. The original problem
+---
 
-The coursework `ParticleManager` scaled its motion noise by the distance driven: a
-standard deviation `sigma_e` per 10 cm, multiplied by `D / 10`. The waypoint script
-*also* rescaled the stored parameters before every move:
+## 1. Problem and motivation
 
-```python
-pm.sigma_e = pm.sigma_e * (dist / 10)   # overwrites the model parameter...
-pm.sigma_f = pm.sigma_f * (dist / 10)
-pm.update_straight(dist)                # ...which then scales by dist/10 again
-```
+The robot is a LEGO differential drive on a Raspberry Pi with a BrickPi3. It localises in
+a 210 × 210 cm walled arena using odometry and **one forward-facing ultrasonic sensor**
+(σ ≈ 1.5 cm, trusted between 20 and 140 cm). It runs Monte Carlo Localisation (MCL)
+[Dellaert et al. 1999]. A single range beam carries very little information per update,
+so how the filter manages particle noise and diversity matters more here than on a
+laser-equipped robot.
 
-With 20 cm steps, the noise standard deviation doubles on *every* move (×2ⁿ after n
-moves). In simulation this variant (`V0-bug`) diverges in 30/30 runs. Its particle spread
-hits the 10⁶ cm cap within about 45 updates, while every corrected variant stays at a few
-centimetres:
+The study asks which of three standard techniques actually help this robot, under what
+conditions, at what computational cost, and with what effect on the robot's behaviour
+when the estimate drives it.
 
-![spread](../experiments/noise_study/results/figures/spread_blowup.png)
+The techniques are reimplemented from the literature and from ROS AMCL; none of them
+is new.
 
-![bug vs fixed](media/bug_vs_fixed.png)
+## 2. The noise-compounding bug and its correction
 
-The general lesson, and the first technique below: **motion noise must depend only on
-the motion being applied, never on state that accumulates between calls.**
+The coursework's waypoint script rescaled the stored motion-noise parameters by
+`distance / 10` before every move, and the motion model then scaled them by
+`distance / 10` again. With 20 cm steps, the noise standard deviation doubled on every
+move.
 
-## 2. Techniques compared
+In the v1 study this diverged in 30 of 30 runs. The particle spread reached the 10⁶ cm
+logging cap within about 45 updates; see
+[`legacy_v1/results/figures/spread_blowup.png`](../experiments/noise_study/legacy_v1/results/figures/spread_blowup.png).
 
-| Key | Variant | What changes | Imitated from | Paper |
+The fix is simply that motion noise depends only on the current motion. The odometry
+motion model below formalises this, and
+`tests/test_motion_models.py::test_no_compounding_between_calls` guards against
+regressions.
+
+The bug was the original motivation for the study. It is **not** used as a baseline in
+v2: every v2 variant uses the corrected motion model, so no technique is made to look
+good by comparison with a broken filter.
+
+## 3. Techniques and definitions
+
+All factorial variants share the odometry motion model, the sonar model, the
+initialisation and the pose estimator. Only the three factors below change.
+
+**Odometry motion model (all variants)** [Thrun, Burgard & Fox 2005, Table 5.6; ROS
+`amcl_odom.cpp`]. A motion is split into rot1, trans and rot2. Each part gets zero-mean
+Gaussian noise whose variance is α-weighted, e.g.
+σ²_trans = α₃·trans² + α₄·(rot1² + rot2²). The α values are fitted to the practical 1
+calibration.
+
+**Sonar model.** p(z | x) = 𝒩(z; ray-cast distance, 1.5²) + 0.001. The constant is a
+floor so that one garbage reading can't zero out a correct particle. Readings outside
+20–140 cm are ignored.
+
+**Pose estimate.** The weighted mean of the particles within 25 cm of the weighted
+median. This mirrors AMCL reporting its strongest cluster.
+
+**E: ESS-gated resampling** [Kong, Liu & Wong 1994; Liu & Chen 1998].
+N_eff = 1 / Σwᵢ². Resample only if N_eff < 0.5·N. Without gating, the filter resamples
+after every valid update. Resampling is systematic (low variance) [Kitagawa 1996].
+
+**I: augmented-MCL injection** [Thrun et al. 2001; Thrun, Burgard & Fox 2005, Table 8.3].
+- Two running averages of the measurement likelihood: w_slow (rate 0.01) and w_fast
+  (rate 0.1).
+- At resampling, each particle is replaced by a uniformly random free-space pose with
+  probability p = max(0, 1 − w_fast / (η·w_slow)), with η = 0.5.
+- Three adaptations for a single sonar beam (from v1, frozen before v2):
+  1. Both averages are seeded from the first measurement.
+  2. Particles injected at the previous step are excluded from the likelihood average.
+     Otherwise there is a runaway feedback loop: injected particles score low, which
+     lowers the average, which triggers more injection.
+  3. η = 0.5 rather than 1, chosen on 12 development seeds in v1.
+
+**K: KLD-sampling** [Fox 2001; Fox 2003].
+- The sample size satisfies n ≥ (k−1)/(2ε) · (1 − 2/(9(k−1)) + √(2/(9(k−1)))·z)³, where
+  k is the number of occupied bins (5 cm × 5 cm × 15°).
+- Parameters: ε = 0.05, z₀.₉₉ = 2.326, with n between n_min = 50 and n_max = 1000. One
+  occupied bin needs exactly n_min particles.
+
+**KLD correction in v2.**
+- **What v1 did:** it drew n_max = 1000 candidates by systematic resampling, shuffled
+  them, and truncated at the bound. That costs work proportional to n_max on every
+  update and is not Fox's procedure.
+- **What v2 does** (`kld.py::kld_resample`): it draws i.i.d. samples from the weights,
+  applies injection to each draw, updates the bin count, and stops at the first n that
+  satisfies the bound.
+  - For speed the draws are generated in chunks.
+  - Because the samples are i.i.d., truncating a chunk at the stopping point gives the
+    same distribution as drawing one at a time, deterministically for a given seed.
+  - `tests/test_kld.py` checks that the returned n is the *first* count satisfying the
+    rule.
+- **Consequence:** v1 and v2 KLD timings are not comparable.
+
+**Diagnostics** (computed per update and logged; not part of the timed filter code):
+- **N_eff/N** before resampling.
+- **Occupied bins.**
+- **Unique-pose fraction:** the share of current particle poses that are unique. This is
+  weak evidence of diversity, because duplicates become distinct after one noisy
+  prediction.
+- **Lineage fraction:** distinct ancestors from the last 5 *resampling events*, divided
+  by N.
+- **Injection probability and particles injected.**
+- **Particle count** before and after resampling.
+- **95% credible radius r95:** the radius around the estimate containing 95% of the
+  particle weight.
+- **Coverage:** the share of updates with error ≤ r95.
+- **False confidence:** r95 ≤ 20 cm **and** error > 20 cm.
+
+## 4. Experimental design and controls
+
+**Variants.** A complete 2³ factorial design (V1–V8), plus fixed-budget controls:
+
+| | ESS (E) | Injection (I) | KLD (K) | Particles |
 |---|---|---|---|---|
-| V0-bug | Coursework + bug | Coursework model with the compounding parameters | (original code) | n/a |
-| V0 | Coursework model | Std scaled by distance; *fixed* turn noise; resample every update | (original code, bug removed) | n/a |
-| V1 | Odometry motion model | Motion = rot1, trans, rot2; variance = α-weighted sum of squared rotation/translation | ROS `amcl_odom.cpp` (`ODOM_MODEL_DIFF`) | [2] Table 5.6 |
-| V2 | V1 + ESS-gated resampling | Resample only when N_eff = 1/Σwᵢ² < N/2; low-variance (systematic) resampler | PythonRobotics `particle_filter.py` (`NTh = NP/2`), AMCL `pf.c` | [3], [4], [5] |
-| V3 | V1 + augmented MCL | Track w_slow, w_fast; inject random poses with p = max(0, 1 − w_fast/(η·w_slow)) | AMCL `pf.c` (`pf_update_resample`) | [2] Table 8.3, [6], [7] |
-| V4 | V1 + KLD-sampling | Particle count from the number of occupied (x, y, θ) bins | AMCL `pf_resample_limit` | [8], [9] |
-| V5 | All combined | V1 + V2 + V3 + V4 | n/a | n/a |
+| V1 | – | – | – | 100 |
+| V2 | ✓ | – | – | 100 |
+| V3 | – | ✓ | – | 100 |
+| V4 | – | – | ✓ | adaptive 50–1000 |
+| V5 | ✓ | ✓ | ✓ | adaptive |
+| V6 | ✓ | ✓ | – | 100 |
+| V7 | ✓ | – | ✓ | adaptive |
+| V8 | – | ✓ | ✓ | adaptive |
+| V3-N500 / V3-N1000 | – | ✓ | – | fixed 500 / 1000 |
+| V1-N1000 | – | – | – | fixed 1000 |
 
-Code: [`motion_models.py`](../src/legobot/localisation/motion_models.py),
-[`resampling.py`](../src/legobot/localisation/resampling.py),
-[`kld.py`](../src/legobot/localisation/kld.py),
-[`particle_filter.py`](../src/legobot/localisation/particle_filter.py).
+V0, the coursework motion model with the bug fixed, appears in tracking only, as a
+historical control.
 
-### Odometry motion model (V1)
-From `sample_motion_model_odometry` [2]:
+**Protocol A: fixed-trajectory replay.** This is the basis of every estimator claim.
+- For each seed, a *reference trace* is generated by a controller that steers using the
+  **true** pose, so no filter influences it.
+- The trace records every commanded motion, every sonar reading (or "no echo"), the true
+  pose and the simulated time.
+- Every variant is fed the identical event sequence. Each filter's own sampling is
+  stochastic but seeded.
+- **Scenarios:**
+  - **Tracking:** 8-waypoint course from a known start; about 40–70 sonar updates per
+    trace.
+  - **Kidnap:** the same course, but after waypoint 3 the robot is moved 30–50 cm and
+    rotated up to ±45°. It then does a 12-step sonar sweep at waypoint 3 and every later
+    waypoint. Each trace has 92–165 post-kidnap updates.
+  - **Global:** an unknown start with 1,000 initial particles for every variant, then
+    4 cycles of a sweep plus a short move.
+- **Seeds:** 1000–1099, held out from all development and tuning.
 
-```
-rot1'  = rot1  + N(0, a1·rot1² + a2·trans²)
-trans' = trans + N(0, a3·trans² + a4·(rot1² + rot2²))
-rot2'  = rot2  + N(0, a1·rot2² + a2·trans²)
-```
+**Protocol B: closed-loop navigation.**
+- The estimate drives the robot, so trajectories, motion noise and sonar readings
+  diverge between variants. Comparisons are therefore **unpaired**.
+- **Fixed budget:** 150 sonar updates (tracking) or 300 (kidnap), and at most 40
+  attempts per waypoint. A failing variant does not get unlimited extra chances.
+- **Variants:** V1, V2, V3, V4, V5, V6, V8 and V3-N1000, chosen before the runs. Seeds
+  1000–1099.
 
-The α values are fitted to the same practical 1 calibration as the coursework sigmas
-(0.3 cm and 0.01 rad per 10 cm, 0.02 rad per 90° turn). The structural difference from V0
-is that a 10° heading correction now adds 9× less rotation noise than a 90° turn, instead
-of the same amount.
+**Noise grid** (Protocol A).
+- The simulator's motion noise is set to 0.5×, 1× or 2× nominal, crossed with sonar
+  outlier probability 0%, 3% or 10%. Filter parameters stay at nominal.
+- **Coverage:** variants V1, V2, V5 and V8; tracking and kidnap; 30 seeds (2000–2029)
+  per cell.
 
-### ESS-gated, low-variance resampling (V2)
-Resampling every update replaces informative weights with duplicates (particle
-depletion). The effective sample size N_eff = 1/Σwᵢ² [3, 4] measures weight degeneracy.
-We resample only when it drops below N/2, as PythonRobotics and AMCL's selective
-resampling do. The resampler is the systematic / low-variance one [5]: one random offset
-and N evenly spaced pointers. It was rewritten with `searchsorted` and a guard on the
-last cumulative weight, which removes an index overflow the coursework loop could hit
-through floating-point round-off.
+**Outcomes.**
+- **Kidnap, primary:** **sustained recovery**, meaning error < 10 cm for ≥ 5 consecutive
+  updates after the kidnap, within the trace horizon. Runs that never recover are
+  censored at the horizon.
+- **Kidnap, also reported:** the v1 metric (final error < 10 cm), "dipped below 10 cm at
+  least once", time to recovery, and post-kidnap error.
+- **Tracking:** mean position error.
+- **Cost:** filter CPU per trajectory (`time.perf_counter`, prediction + update).
+  - Machine: a Windows 11 laptop with an Intel Core (Family 6 Model 142) CPU, 8 logical
+    cores, Python 3.14.2 and NumPy 2.5.4, recorded in `results/metadata/`.
+  - **These are not Raspberry Pi timings.**
 
-### Augmented MCL: random particle injection (V3)
-Two exponential averages of the measurement likelihood are tracked: `w_slow` (rate
-0.01) and `w_fast` (rate 0.1). When recent measurements fit much worse than usual,
-`w_fast` falls below `w_slow`, and that fraction of resampled particles is replaced by
-uniformly random poses in free space [2, 6].
+**Statistics.**
+- Proportions: Wilson 95% intervals.
+- Paired Protocol A differences: bootstrap over seeds (10,000 resamples).
+- Factorial effects: ±1 contrasts over the 8 cell means, with a paired bootstrap.
+- Closed-loop means: unpaired bootstrap.
 
-**What we had to change for a single sonar beam:**
+**Prespecified decision rule.** An injection × KLD *synergy* is claimed only if the I×K
+contrast excludes 0 **and** V8 beats the matched-budget control.
 
-1. **Seeding.** AMCL starts both averages at 0. That means `w_slow` needs hundreds of
-   updates before injection can ever trigger, so we seed both from the first measurement.
-2. **A feedback loop.** Injected particles almost always score at the likelihood floor.
-   Counting them in `w_avg` lowers `w_fast`, which injects more particles, and so on. In
-   a traced run, 30–44% of the particles were being replaced on every update. Particles
-   injected at the previous step therefore don't vote.
-3. **A threshold η = 0.5.** One beam's average likelihood fluctuates far more than a
-   laser scan's, so the textbook rule (η = 1) fires constantly. In a 12-seed tuning run,
-   η = 1 injected about 1,028 particles per tracking run; η = 0.5 injected about 9.
-4. **The estimate.** Like AMCL, which reports its highest-weight cluster, the pose
-   estimate is the mean of the particles within 25 cm of the weighted median. A minority
-   of stray particles can't drag it away. Every variant uses the same estimator.
+**Execution and provenance.**
+- Each batch was run exactly once: traces 14 s, main 289 s, closed loop 138 s, noise
+  grid 285 s, global diagnostic 188 s.
+- No simulation was repeated to make figures.
+- The runs used the working tree on top of commit `df03434`, before the v2 changes were
+  committed. The metadata records this as `dirty: yes`.
+- Analysis code was extended after the first look at the results (robust error summaries,
+  runaway analysis, Kaplan–Meier truncation). Those additions are marked exploratory.
 
-### KLD-sampling (V4)
-Fox's bound [8, 9] sets the particle count from the number of occupied histogram bins
-(5 cm × 5 cm × 15° here): ε = 0.05, δ = 0.01, between 50 and 1000 particles. Samples are
-drawn in random order until the bound for the bins seen so far is met.
+## 5. Accuracy and efficiency
 
-## 3. Scenarios
+**Tracking accuracy is a tie** (`summary.md`, Protocol A tracking).
+- Every variant has a mean error between 1.86 and 2.16 cm, and 98–100% of runs end
+  within 10 cm.
+- Of the 7 factorial contrasts on tracking error, only one has a CI excluding 0: E×I,
+  −0.06 cm, CI [−0.13, −0.002]. It is marginal and far below the sonar's resolution, and
+  reads best as noise.
+- The only robust accuracy difference comes from more particles: V1-N1000 is 0.15 cm
+  better than V1 (CI [−0.23, −0.08]). That is statistically clear and practically
+  negligible.
 
-All scenarios use the practical 4 arena and the coursework sensing: one forward-facing
-sonar with σ = 1.5 cm, trusted between 20 and 140 cm. The simulated robot's true noise
-comes from the practical 1 calibration plus a small constant per turn that no filter
-models. Its sonar loses echoes at steep incidence and returns 3% random outliers.
-Seeds are fixed, so runs are reproducible.
+**ESS gating is the one free improvement in cost.**
+- In tracking it resamples on 36% of valid updates instead of 100%.
+- That cuts CPU per trajectory by 13% (9.1 → 7.9 ms; −1.2 ms, CI [−1.3, −1.1]).
+- Accuracy is unchanged (−0.03 cm, CI [−0.12, 0.05]).
+- The unique-pose fraction rises from 0.76 to 0.84. But the lineage fraction *falls*
+  (0.28 → 0.24), because its window counts resampling events, and under gating 5
+  resamples span about 3× more updates. The diversity gain is real but modest, and the
+  two diversity metrics answer different questions.
 
-- **Tracking:** known start, then drive the 8-waypoint practical 4 course (turn, then
-  drive at most 20 cm, then one sonar update).
-- **Kidnap:** the same course, but after waypoint 3 the robot is moved 30–50 cm and
-  rotated up to ±45°. Afterwards it does a 12-step sonar sweep at every waypoint.
-- **Global:** unknown start, uniform particles (1,000 for fixed-size filters). Four cycles
-  of a 12-step sweep followed by a short move.
+**KLD-sampling does not reduce computation on this robot, even with fewer particles**
+(Figure 7; `cpu_stages.csv`).
 
-"Success" means the final position error is under 10 cm.
+![CPU breakdown](../experiments/noise_study/results/figures/07_cpu_breakdown.png)
 
-## 4. Results (30 seeds per cell)
+- **Per-update cost in the kidnap scenario** (median):
 
-### Scorecard
+  | Variant | Particles | Median CPU per update |
+  |---|---|---|
+  | V1 | 100 | 0.29 ms |
+  | V4 | about 200 | 0.72 ms |
+  | V3-N1000 | 1000 | 0.92 ms |
+  | V8 | about 590 | 2.27 ms |
 
-Each column is shaded relative to the other variants: darker means better on that
-metric. The numbers are the actual measurements.
+- **Where KLD's time goes:** bin accounting takes 40–48% of every KLD update. That is the
+  per-sample histogram encoding and new-bin bookkeeping in `kld_resample`. On top of it,
+  the chunked sampler issues several small NumPy calls per update.
+- **What scales with particles:** ray casting grows about linearly, from 0.18 ms at 100
+  particles to 0.52 ms at 1000.
+- **Conclusion:** with this vectorised Python implementation, KLD's bookkeeping costs
+  more than the particles it saves, at every particle count we observed.
+- **In global localisation** KLD does save time: V5 and V7 are about 40% cheaper than V1
+  there. That's because it drops from 1,000 to about 180 particles on average and
+  bookkeeping is a smaller share.
+- **Caveat:** this is an implementation-level result. A compiled implementation (as in
+  AMCL's C code) has a far smaller per-sample bookkeeping cost, and the balance could
+  reverse.
 
-![scorecard](../experiments/noise_study/results/figures/scorecard.png)
+## 6. Ablation and interaction analysis
 
-### What each technique buys and what it costs
+![Factorial interaction](../experiments/noise_study/results/figures/02_factorial_interaction.png)
 
-Each point is one variant, averaged over 30 runs.
+**Factorial effects on sustained kidnap recovery** (`factorial_effects.csv`, ±1
+contrasts, 95% paired bootstrap CI):
 
-- **Tracking:** every variant is accurate to within 0.25 cm, so the differences that
-  matter are in cost. ESS gating is both the most accurate and the cheapest.
-- **Kidnap:** only the combined filter (V5) recovers in a meaningful share of runs, and
-  it pays about 7× the update cost for it.
+| Effect | Estimate | 95% CI |
+|---|---|---|
+| Injection (I) | **+29.2 pp** | [+23.2, +35.3] |
+| KLD (K) | **+19.2 pp** | [+14.5, +23.8] |
+| I × K | **+19.2 pp** | [+14.5, +23.7] |
+| ESS (E) | +3.2 pp | [−1.2, +7.8] |
+| E×I, E×K, E×I×K | ≤ 2.2 pp | all CIs include 0 |
 
-![trade-off](../experiments/noise_study/results/figures/tradeoff.png)
+- **On its face, a strong injection × KLD interaction.**
+  - Injection adds 11 pp without KLD: V3 − V1 = 19% − 8%, CI [+2, +20].
+  - It adds 45 pp with KLD: V8 − V4 = 54% − 9%, CI [+34, +56].
+  - The difference between those two is +34 pp, CI [+21, +47].
+  - KLD alone does nothing: V4 − V1 = +1 pp, CI [−2, +5].
+- **The budget controls explain it** (Figure 3; `paired_comparisons.csv`):
 
-### Resampling: every update vs only when needed (V1 vs V2)
+  | Comparison | Recovery | CPU per kidnap trajectory | Particles |
+  |---|---|---|---|
+  | V8 vs V3-N500 | 54% vs 54% (0 pp, CI [−13, +13]) | 156 vs 56 ms | 589 vs 500 |
+  | V8 vs V3-N1000 | 54% vs 59% (−5 pp, CI [−18, +9]) | 156 vs 79 ms | 589 vs 1000 |
+  | V3-N1000 vs V3 | **+40 pp** (CI [+28, +52]) | | 1000 vs 100 |
+  | V1-N1000 vs V1 | +5 pp (CI [0, +11]) | | 1000 vs 100 |
 
-ESS gating resamples on 30% of updates instead of 83%. The remaining updates are sonar
-readings outside the trusted range, which both variants skip.
+- **Interpretation.** Injection needs a large particle set. The random poses need
+  somewhere to live long enough to be weighted by the sweeps.
+  - KLD supplies that set adaptively: KLD filters grow to the 1,000 cap after injection
+    widens the cloud (Figure 6).
+  - A fixed 500–1000-particle injection filter supplies the same thing at a third to a
+    half of the CPU.
+  - Particles without injection don't help (V1-N1000).
+- **Verdict under the prespecified rule:** I×K is "significant", but V8 does not beat the
+  matched-budget control. **The interaction reflects particle budget, not a synergy
+  between the techniques.**
 
-Letting weights accumulate between resamples makes them more uneven (lower N_eff/N on
-the left). In exchange, the filter keeps more distinct particles (middle), which is the
-quantity that protects against depletion.
+![Recovery vs computation](../experiments/noise_study/results/figures/03_recovery_vs_computation.png)
 
-![resampling](../experiments/noise_study/results/figures/resampling.png)
+**ESS gating has no measurable effect on recovery.**
+- V6 − V3 = +1 pp (CI [−9, +11]).
+- V5 − V8 = +8 pp (CI [−5, +21]).
+- It does make V5 cheaper than V8 (−24 ms per trajectory, CI [−37, −12]), because about
+  35% of V5's updates skip resampling.
 
-### KLD-sampling: fewer particles, not more correct (V1 vs V4, V5)
+## 7. Kidnapping recovery and failure behaviour
 
-- **Global (right):** KLD drops from 1,000 to about 70 particles within ten updates. Its
-  error is no better than the fixed 1,000-particle filter's, because it shrinks onto
-  whichever hypothesis dominates, right or wrong.
-- **Tracking (left):** KLD uses *more* particles than the fixed 100, because a few-cm
-  cloud straddles several 5 cm × 15° bins.
+**Recovery metrics disagree, and the differences matter** (`summary.md`, Protocol A
+kidnap; n = 100 each):
 
-![kld](../experiments/noise_study/results/figures/kld_particles.png)
+| Variant | Sustained recovery | Final < 10 cm (v1 metric) | Dipped below 10 cm at least once |
+|---|---|---|---|
+| V1 | 8% [4, 15] | 4% [2, 10] | 19% |
+| V3 | 19% [13, 28] | 8% [4, 15] | 89% |
+| V8 | 54% [44, 63] | 38% [29, 48] | 93% |
+| V5 | 62% [52, 71] | 45% [36, 55] | 92% |
+| V3-N1000 | 59% [49, 68] | 36% [27, 46] | 92% |
 
-### Recovering from a kidnap: each technique vs the baseline
+- Injection filters touch the right answer in about 90% of runs. With only 100 particles
+  (V3), that is mostly brief contact, not recovery.
+- The v1 metric (final error) is 10–25 pp lower than sustained recovery because
+  recoveries **relapse**: 17 of V5's 62 sustained recoveries, 18 of V8's 54 and 24 of
+  V3-N1000's 59 were back above 10 cm at the final update (`main_runs.csv`).
+- Final-error success without a sustained recovery is rare (0–2 runs per variant).
+- A sustained recovery is therefore not a permanent one, and neither metric alone
+  describes the outcome.
 
-The robot is moved 30–50 cm after waypoint 3. The gray line in every panel is V1; the
-coloured line is the technique named in the panel title.
+**Time to recovery** (Figure 4, Kaplan–Meier, runs censored at their trace horizon).
 
-Only V5's interquartile band reaches below the 10 cm success line. V3's error rises
-above the baseline instead: its injected particles pull the estimate around without
-enough particles to settle on the truth.
+![Recovery over time](../experiments/noise_study/results/figures/04_recovery_over_time.png)
 
-![kidnap](../experiments/noise_study/results/figures/kidnap_recovery.png)
+- At update 99 after the kidnap (the last point where at least 20 traces are still
+  observed), these are not yet recovered:
 
-### Why injection needs KLD (V3 vs V5)
+  | Variant | Not yet recovered |
+  |---|---|
+  | V5 | 44% |
+  | V3-N1000 | 44% |
+  | V8 | 48% |
+  | V6 | 81% |
+  | V3 | 83% |
+  | V1 | 92% |
 
-With a fixed 100 particles, V3 can inject only a handful of random guesses per update.
-In V5, injection widens the cloud, KLD responds by growing the filter to its 1,000
-particle cap, and that leaves room for 50–150 random guesses per update. That's what
-gives a guess a realistic chance of landing near the true pose.
+- The large-budget injection filters are indistinguishable over the whole time course.
+- Recoveries begin about 20 updates after the kidnap, i.e. after the first full sonar
+  sweep.
 
-![injection](../experiments/noise_study/results/figures/injection.png)
+**Runaway estimates** (exploratory; `kidnap_runaway_duration.csv`,
+`kidnap_robust_error.csv`).
+- Mean post-kidnap error suggests injection halves the error (117 → 63 cm). That mean is
+  dominated by a few runs.
+- The estimate leaves the arena (error > 300 cm) at least once in a similar share of
+  runs for every variant: 5–8 of 100.
+- **Without injection** those runaways are permanent: 82% of post-kidnap updates are over
+  3 m off, and the final error is about 15 m. Nothing pulls particles back into free
+  space once every particle sits on the likelihood floor.
+- **With injection** they end: about 18% of updates are over 3 m, and the final error is
+  55–80 cm.
+- The *typical* run barely differs. The median over runs of the post-kidnap median error
+  is 41 cm for V1, 46 cm for V3 and 39–40 cm for V8 and V3-N1000. Within that, V3 is
+  6 cm *worse* than V3-N1000 (CI [−8.4, −1.7] for V3-N1000 − V3).
+- **Conclusion:** injection's main contribution is to **bound catastrophic divergence**,
+  not to make the typical estimate more accurate.
 
-### Every run, not just the averages
+**What the particle cloud does** (Figures 5 and 6).
 
-One dot is one run's final error; the bar is the median.
+![Case trajectories](../experiments/noise_study/results/figures/05_case_trajectories.png)
 
-- **Tracking:** every variant sits well under the 10 cm line.
-- **Kidnap:** V5's recovered runs form a separate cluster around 1 cm.
-- **Global:** a few runs per variant converge (the dots under 10 cm); the rest stay
-  50–200 cm off.
+- Right after the kidnap, every filter is **falsely confident**: in both examples the
+  error is about 38 cm with r95 of 3–4 cm.
+- In the recovered run, the cloud stays confidently wrong through the first sweep and
+  only locks onto the correct pose later in the trace.
+- In the failed run, it ends 65 cm off with r95 = 3 cm.
+- Figure 6 shows the mechanism behind §6. Injection probability rises to 0.2–0.4 after
+  the kidnap.
+  - V3 can inject only 10–40 particles per update.
+  - V8, V5 and V3-N1000 inject 100–250 per update, and KLD variants grow to the
+    1,000-particle cap within about 20 updates.
 
-![final errors](../experiments/noise_study/results/figures/final_errors.png)
+![Particle dynamics](../experiments/noise_study/results/figures/06_particle_dynamics.png)
 
-### Full table
+**Uncertainty calibration** (Figure 10; `uncertainty.csv`).
+- **Tracking:** the 95% credible circle covers the truth on 92–97% of updates, and false
+  confidence is essentially absent (≤ 0.1%).
+- **Kidnap without injection:** coverage collapses to about 10%, and 68–72% of all kidnap
+  updates are falsely confident.
+- **Kidnap with injection:** coverage rises to about 70%, but about 19% of updates are
+  still falsely confident.
+- **Global:** 43–58% of updates are falsely confident.
+- **Conclusion:** a narrow particle cloud is not evidence of correct localisation after a
+  disturbance.
 
-| Scenario | Variant | Success | Median final error (cm) | Mean error (cm) | Median max spread (cm) | N_eff/N | Distinct | Resampled | Mean particles | Injected / run | ms / update |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| tracking | V0-bug | 0% | diverged | diverged | 1.00e+06 | 0.93 | 0.97 | 45% | 100 | 0 | 0.25 |
-| tracking | V0 | 100% | 2.0 | 1.9 | 4.9 | 0.72 | 0.78 | 84% | 100 | 0 | 0.24 |
-| tracking | V1 | 100% | 2.4 | 2.1 | 6.3 | 0.69 | 0.76 | 83% | 100 | 0 | 0.24 |
-| tracking | V2 | 100% | 1.8 | 1.9 | 6.2 | 0.59 | 0.84 | 30% | 100 | 0 | 0.21 |
-| tracking | V3 | 100% | 2.4 | 2.1 | 6.4 | 0.69 | 0.76 | 83% | 100 | 2 | 0.26 |
-| tracking | V4 | 100% | 1.9 | 1.9 | 6.0 | 0.67 | 0.62 | 83% | 173 | 0 | 0.69 |
-| tracking | V5 | 100% | 2.0 | 1.9 | 6.0 | 0.59 | 0.82 | 29% | 159 | 0 | 0.39 |
-| kidnap | V0 | 3% | 27.8 | 43.8 | 9.6 | 0.79 | 0.90 | 58% | 100 | 0 | 0.24 |
-| kidnap | V1 | 0% | 30.7 | 44.6 | 8.4 | 0.81 | 0.91 | 57% | 100 | 0 | 0.24 |
-| kidnap | V2 | 0% | 28.9 | 43.7 | 7.9 | 0.75 | 0.93 | 11% | 100 | 0 | 0.20 |
-| kidnap | V3 | 7% | 85.7 | 70.7 | 529.9 | 0.38 | 0.92 | 36% | 100 | 2893 | 0.34 |
-| kidnap | V4 | 0% | 32.5 | 44.2 | 7.2 | 0.79 | 0.76 | 57% | 182 | 0 | 0.71 |
-| kidnap | V5 | 37% | 56.1 | 60.1 | 615.6 | 0.37 | 0.91 | 25% | 785 | 23734 | 1.75 |
-| global | V0 | 7% | 101.4 | 86.5 | 78.6 | 0.63 | 0.84 | 57% | 1000 | 0 | 0.63 |
-| global | V1 | 7% | 100.8 | 83.1 | 78.7 | 0.69 | 0.86 | 57% | 1000 | 0 | 0.67 |
-| global | V2 | 3% | 100.9 | 81.6 | 78.7 | 0.60 | 0.88 | 19% | 1000 | 0 | 0.53 |
-| global | V3 | 7% | 96.8 | 82.6 | 78.8 | 0.69 | 0.86 | 57% | 1000 | 21 | 0.61 |
-| global | V4 | 3% | 91.6 | 77.2 | 78.6 | 0.80 | 0.75 | 57% | 154 | 0 | 0.60 |
-| global | V5 | 3% | 76.3 | 77.7 | 78.6 | 0.68 | 0.90 | 16% | 164 | 1 | 0.42 |
+![Uncertainty](../experiments/noise_study/results/figures/10_uncertainty_diagnostics.png)
 
-How to read the columns:
+## 8. Closed-loop navigation reliability (Protocol B)
 
-- *N_eff/N* is measured right after weighting, before any resampling.
-- *Distinct* is the fraction of particles that aren't duplicates, i.e. how much
-  depletion there is.
-- *Resampled* is the share of sonar updates that resampled.
-- Timings are from a laptop, vary by about ±0.02 ms between runs, and are only useful
-  for comparing variants with each other.
+![Navigation](../experiments/noise_study/results/figures/09_navigation_tradeoff.png)
 
-## 5. Findings
+**Tracking:** every variant completes the course. 92–99% of runs truly reach all 8
+waypoints (true pose within 10 cm when the waypoint is declared), with **0 wall
+contacts** and about 79 s of simulated time for every variant.
 
-1. **The blow-up was a bug, not a modelling limit.** Remove the compounding and every
-   model tracks the course (30/30 runs, ~2 cm final error, 0 wall contacts). The unit
-   test `test_no_compounding_between_calls` now guards against it.
-2. **The odometry model is the principled version of the fix, but on this course it
-   doesn't measurably beat the corrected coursework model** (2.4 vs 2.0 cm). The course
-   is mostly 20 cm steps and ~90° turns, which is exactly where the fixed 0.02 rad turn
-   noise is right. V1's advantage would show on routes with many small corrections.
-3. **ESS gating is the cheapest real improvement:**
-   - It keeps 84% distinct particles vs 76% when resampling every update.
-   - It gives the lowest tracking error (1.8 cm median).
-   - It's the fastest variant (0.21 ms/update), because 70% of updates skip resampling.
-4. **KLD-sampling cuts cost, but it doesn't make the filter more correct.**
-   - In global localisation it drops from 1,000 to about 70 particles within about 10
-     updates.
-   - KLD measures how concentrated the cloud is, not whether it's right. It shrank onto
-     wrong hypotheses as readily as the fixed 1,000-particle filter converged
-     (3% vs 7% success).
-   - In tracking it used *more* particles than the fixed 100 (173), because a few-cm
-     cloud straddles several 5 cm/15° bins. The bin size matters as much as ε.
-5. **Injection only helps when there are enough particles to inject into.**
-   - On its own (V3, 100 particles) it rarely recovers from a kidnap (7%). It makes the
-     estimate jump, and the robot hit walls about 70 times per run versus about 3.
-   - Combined with KLD (V5), the injected spread raises the particle count (785 on
-     average). V5 then recovers in 37% of runs, the best of all variants, at about 7×
-     the update cost.
-6. **Global localisation with one sonar beam is barely observable.** Every variant
-   converges in at most 7% of runs. During development, neither 10,000 particles nor a
-   noise-free simulator (with 3,000 particles) got past about 20%. With σ = 1.5 cm the likelihood is so
-   peaked that particles slightly off the truth die out (sample impoverishment). This is
-   a sensing limit; the remedies are a richer sensor (a scanning sonar or camera) or the
-   sweep-based active localisation used here.
+**Kidnap:** recovery-oriented configurations destabilise navigation.
 
-**Recommendation for this robot:** V2 (odometry model + ESS gating) for normal
-operation, and V5 when the robot may lose track (e.g. bumped or picked up), accepting
-the higher compute cost. V5 is the default in `mcl_navigate.py`.
+| Variant | Sustained recovery | Wall contacts per run | All 8 waypoints truly reached | Simulated time |
+|---|---|---|---|---|
+| V1, V2, V4 | 7–12% | 3.4–3.6 | 0% | about 144 s |
+| V3-N1000 | 49% [39, 59] | 51 | 5% | about 290 s |
+| V8 | 40% [31, 50] | 51 | 4% | about 300 s |
+| V5 | 35% [26, 45] | 61 | 3% | about 310 s |
 
-**Limitations:**
-- These are simulation results. The simulator's noise is calibrated from the practical 1
-  measurements, not validated on the robot.
-- The thresholds (η, ε, bin sizes) were tuned on a small grid, not optimised.
+- **Without injection** the robot confidently drives the rest of the course on a wrong
+  belief. It declares all 8 waypoints reached, but only about 3.1 of them truly (roughly
+  the 3 before the kidnap), and it rarely hits a wall.
+- With injection, about 3.8–4.1 waypoints are truly reached.
+- **With injection** the estimate jumps between hypotheses, so the navigation controller
+  issues turns and drives toward walls. Every injection variant has about 13–17× more
+  wall contacts, gives up on about 1.0–1.4 waypoints per run (the attempt cap), and takes
+  twice as long. The 300-update budget was never exhausted.
+- **Ranking:** closed-loop recovery follows the Protocol A ranking, with V3-N1000 ≥ V8 ≥
+  V5 ≫ V1. V5 has the most collisions.
+- **For physical deployment**, this is a strong argument for *gating navigation on
+  localisation confidence* (stop and sweep until recovered) rather than for adopting V5
+  as-is. The policy wasn't tested here.
+
+## 9. Sensitivity to noise-model mismatch
+
+![Noise robustness](../experiments/noise_study/results/figures/08_noise_robustness.png)
+
+Thirty seeds per cell, so each recovery proportion carries about ±17 pp of uncertainty.
+These results are descriptive.
+
+- **Recovery ranking holds in all 9 conditions.** V5 and V8 recover in 30–70% of runs;
+  V1 and V2 in 0–17%. Recovery barely depends on motion noise in the 0.5×–2× range.
+- **V8 may be sensitive to outliers.** At 10% sonar outliers V8 drops in every motion row
+  (70 → 50, 63 → 40, 53 → 30%), while V5 stays at 47–53%. This is consistent with ESS
+  gating damping injection triggered by spurious readings, but it rests on 30 seeds and
+  is a hypothesis, not a finding.
+- **Tracking error scales with true motion noise** for every variant: about 1.4 cm at
+  0.5×, about 1.9 cm at 1×, and 3.3–5.7 cm at 2×. Failures (final error ≥ 10 cm) reach
+  7–27% at 2×.
+- At 2× motion noise no variant is clearly better; the CIs overlap.
+- The filters' motion model is fixed at nominal noise, so 2× noise is under-modelled for
+  all of them alike.
+
+## 10. Global-localisation limitations
+
+![Global diagnostic](../experiments/noise_study/results/figures/11_global_diagnostic.png)
+
+**Global success is low for every variant.** Sustained convergence is 10–21%, e.g. V1
+20% [13, 29] and V2 21%. KLD reduces it slightly: K main effect −4.5 pp, CI [−8.8, −0.2].
+That's consistent with KLD shrinking confidently onto wrong hypotheses.
+
+The v2 numbers are higher than v1's 3–7% because the global traces differ: the
+ground-truth controller produces different sweeps and moves. Old and new values are not
+comparable.
+
+**Is the sensor to blame?** The prespecified diagnostic evaluates the likelihood of the
+first 12-reading sweep over every start pose on a 2.5 cm × 5° grid
+(`raw/global_diag/global_diag.csv.gz`).
+
+- **The truth is plausible in 90 of 100 traces** (within a factor of 100 of the
+  best-fitting start).
+- **Ambiguous in 50 of 100:** some start more than 20 cm away fits nearly as well
+  (within a factor of 10).
+- **Unambiguous and plausible in 48 of 100:** the sweep identifies the true start, yet
+  V1 converges in only 12 of those 48, and V5 and V8 in 7.
+  - The median particle mass near the truth after the sweep is **0.00** in these cases.
+  - 1,000 uniform particles almost never place one close enough to the truth to survive
+    a σ = 1.5 cm likelihood.
+
+**Conclusion:** about half of the global failures stem from genuine sensor ambiguity.
+The other half are **sampling failures**: a valid hypothesis exists, but the particle set
+never holds it. Single-beam sensing is part of the explanation, not all of it. Plausible
+remedies were not tested:
+- likelihood tempering during the first sweep
+- seeding particles from the measurement (sensor-resetting localisation, Lenser &
+  Veloso 2000)
+- a denser initial set
+
+Under the tested conditions, global localisation should be treated as **unreliable**.
+
+## 11. Statistical uncertainty and threats to validity
+
+- **Simulation only.** The simulator's noise is set from the practical 1 calibration.
+  No result here has been checked on the robot.
+- **One arena and one sensor layout.** The arena geometry produces the ambiguity
+  structure in §10.
+- **Development parameters.** Injection η = 0.5, the w_slow/w_fast rates and the cluster
+  radius were tuned in v1 on seeds 0–29 (12 seeds for η). They were frozen before v2 and
+  never tuned on the evaluation seeds 1000–1099 or 2000–2029.
+- **Multiple comparisons.** 49 factorial contrasts and about 100 paired comparisons are
+  reported without correction. Isolated marginal effects (e.g. tracking E×I, global K)
+  should be read with that in mind. The headline effects (I, K, I×K on recovery;
+  V3-N1000 − V3; ESS cost reduction) have CIs far from 0.
+- **Closed loop is unpaired.** Trajectories diverge, so Protocol B intervals are wider
+  and differences partly reflect different robot paths.
+- **Kaplan–Meier tails.** Trace horizons vary (92–165 updates). Curves are truncated
+  where fewer than 20 traces remain; the truncation point was chosen after seeing the
+  data.
+- **Timing.** Laptop wall-clock (`perf_counter`), single process, all variants
+  interleaved within each 10-seed block. The KLD cost conclusion applies to *this* Python
+  implementation.
+- **Lineage metric.** Its window counts resampling events, not updates, so it is not
+  comparable between gated and ungated filters.
+- **Exploratory additions** (after the first look at the results): robust median and
+  runaway analyses, the Kaplan–Meier truncation, and the noise-grid interpretation.
+
+## 12. Engineering conclusions and future work
+
+What the evidence supports, with the section it comes from:
+
+1. **Fix the motion model first** (§2). The original "growing noise" was a bug. Once it
+   is fixed, every variant tracks the course to about 2 cm.
+2. **Use ESS-gated resampling** (§5). It is the only technique with a clear benefit at no
+   cost: 13% less CPU in tracking, unchanged accuracy, and higher unique-pose diversity.
+3. **For kidnap recovery, use injection with a large particle budget** (§6, §7). It
+   recovers in about 55–60% of runs within the horizon, against 8% for the baseline.
+   The benefit comes from the budget: a fixed 500–1000-particle injection filter matches
+   V5 and V8 at a third to half the CPU. **The injection × KLD "synergy" reported in v1
+   is not supported.**
+4. **KLD-sampling, as implemented here, is not worth it for tracking or kidnap** (§5). It
+   saves CPU only in global localisation, and it slightly lowers global success.
+5. **Injection bounds divergence rather than improving typical accuracy** (§7), and in
+   closed loop it causes 13–17× more wall contacts (§8). Any deployment should stop the
+   robot and sweep until the filter is confident again, not keep navigating on a jumping
+   estimate.
+6. **Don't trust a narrow particle cloud after a disturbance** (§7). False confidence
+   affects about 19% of post-kidnap updates even with injection, and about 70% without
+   it.
+7. **Global localisation is unreliable** with this sensing (§10), and half of its
+   failures are sampling failures.
+
+**Recommended configuration for this robot (simulation evidence only):**
+- **V2 (odometry model + ESS gating)** for normal navigation. It is now the default in
+  `mcl_navigate.py`.
+- **Injection with a fixed 500–1000-particle budget**, combined with a stop-and-sweep
+  recovery behaviour, for situations where the robot may be moved. This combination is
+  untested.
+- **Not V5 as-is.** Its recovery advantage over the cheaper control is nil, and its
+  closed-loop collision rate is the highest.
+
+**Future work:**
+- Validate on the physical robot, particularly the recovery and collision findings.
+- Test a confidence-gated navigation policy.
+- Try sensor-resetting or measurement-driven injection for global localisation.
+- Write a compiled KLD to separate algorithmic from interpreter cost.
 
 ## References
 
 1. F. Dellaert, D. Fox, W. Burgard, S. Thrun. *Monte Carlo Localization for Mobile Robots.* ICRA 1999.
-2. S. Thrun, W. Burgard, D. Fox. *Probabilistic Robotics.* MIT Press, 2005. Table 4.4 (low-variance sampler), Table 5.6 (`sample_motion_model_odometry`), Table 8.3 (`Augmented_MCL`).
-3. A. Kong, J. S. Liu, W. H. Wong. *Sequential Imputations and Bayesian Missing Data Problems.* Journal of the American Statistical Association 89(425), 1994.
-4. J. S. Liu, R. Chen. *Sequential Monte Carlo Methods for Dynamic Systems.* Journal of the American Statistical Association 93(443), 1998.
-5. G. Kitagawa. *Monte Carlo Filter and Smoother for Non-Gaussian Nonlinear State Space Models.* Journal of Computational and Graphical Statistics 5(1), 1996.
+2. S. Thrun, W. Burgard, D. Fox. *Probabilistic Robotics.* MIT Press, 2005 (Tables 4.4, 5.6, 8.3).
+3. A. Kong, J. S. Liu, W. H. Wong. *Sequential Imputations and Bayesian Missing Data Problems.* JASA 89(425), 1994.
+4. J. S. Liu, R. Chen. *Sequential Monte Carlo Methods for Dynamic Systems.* JASA 93(443), 1998.
+5. G. Kitagawa. *Monte Carlo Filter and Smoother for Non-Gaussian Nonlinear State Space Models.* JCGS 5(1), 1996.
 6. S. Thrun, D. Fox, W. Burgard, F. Dellaert. *Robust Monte Carlo Localization for Mobile Robots.* Artificial Intelligence 128(1–2), 2001.
 7. J.-S. Gutmann, D. Fox. *An Experimental Comparison of Localization Methods Continued.* IROS 2002.
 8. D. Fox. *KLD-Sampling: Adaptive Particle Filters.* NIPS 2001.
-9. D. Fox. *Adapting the Sample Size in Particle Filters Through KLD-Sampling.* International Journal of Robotics Research 22(12), 2003.
-10. S. Lenser, M. Veloso. *Sensor Resetting Localization for Poorly Modelled Mobile Robots.* ICRA 2000. (An alternative to uniform injection: sample new particles from the measurement.)
+9. D. Fox. *Adapting the Sample Size in Particle Filters Through KLD-Sampling.* IJRR 22(12), 2003.
+10. S. Lenser, M. Veloso. *Sensor Resetting Localization for Poorly Modelled Mobile Robots.* ICRA 2000.
 
-Reference implementations studied:
-[ROS navigation `amcl`](https://github.com/ros-planning/navigation/tree/noetic-devel/amcl)
-(`src/amcl/sensors/amcl_odom.cpp`, `src/amcl/pf/pf.c`),
-[PythonRobotics particle filter](https://github.com/AtsushiSakai/PythonRobotics/tree/master/Localization/particle_filter),
-[Nav2 AMCL parameter guide](https://docs.nav2.org/rolling/configuration_and_development/configuration_guide/others/configuring_amcl/).
+Reference implementations: ROS navigation `amcl` (`amcl_odom.cpp`, `pf/pf.c`) and
+PythonRobotics `particle_filter.py`.

@@ -1,0 +1,9 @@
+variant,ambiguous,converged,hypothesis lost,truth implausible
+V1,38,18,36,8
+V2,38,16,37,9
+V3,41,8,42,9
+V4,39,9,42,10
+V5,39,11,41,9
+V6,41,11,39,9
+V7,38,7,46,9
+V8,41,10,41,8

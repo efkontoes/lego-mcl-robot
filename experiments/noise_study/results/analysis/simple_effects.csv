@@ -1,0 +1,2 @@
+contrast,estimate,ci_lo,ci_hi
+(V8 - V4) - (V3 - V1): injection effect with KLD minus without,0.34,0.21,0.47000000000000003
