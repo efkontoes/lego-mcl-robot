@@ -307,7 +307,7 @@ physical robot.
 
 This began as group coursework for the robotics course at Imperial College London
 (practicals 1–6), developed as a team. This repository is a
-rewrite of that code: I unified and deduplicated it, added the simulator and tests, and
+rewrite of that code: I unified it, added the simulator and tests, and
 carried out the noise study. [docs/coursework_map.md](docs/coursework_map.md) maps each
 practical to its new location and lists what changed.
 
