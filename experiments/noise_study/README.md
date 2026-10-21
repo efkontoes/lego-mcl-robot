@@ -29,6 +29,7 @@ Batches can also be run individually: `traces`, `main`, `closed_loop`, `noise`,
 | `run_study.py` | Batch runner |
 | `analyze.py` | Per-run metrics, intervals, factorial contrasts, budget comparisons → `results/analysis/` |
 | `make_figures.py` | The 11 figures, reading only saved results |
+| `animations/` | ManimGX animations built from the saved results (see its README) |
 | `results/traces/` | Reference traces (gzipped JSON): every motion, sonar reading, true pose and kidnap event |
 | `results/raw/main/` | Protocol A per-update logs (seeds 1000–1099), particle snapshots for seeds 1000–1009 |
 | `results/raw/closed_loop/` | Protocol B per-run summaries and per-update logs |

@@ -231,6 +231,13 @@ contrast excludes 0 **and** V8 beats the matched-budget control.
 
 ![CPU breakdown](../experiments/noise_study/results/figures/07_cpu_breakdown.png)
 
+![KLD-sampling in action](../experiments/noise_study/results/animations/kld_sampling.gif)
+
+*The real `kld_resample` run on two saved V8 particle clouds. A tight cloud occupies 6
+bins and stops at n = 152. A spread cloud occupies 147 bins, whose bound (1,887) exceeds
+the 1,000 cap. Every draw updates the bin count, which is the bookkeeping that dominates
+KLD's CPU cost.*
+
 - **Per-update cost in the kidnap scenario** (median):
 
   | Variant | Particles | Median CPU per update |
@@ -295,6 +302,11 @@ contrasts, 95% paired bootstrap CI):
   between the techniques.**
 
 ![Recovery vs computation](../experiments/noise_study/results/figures/03_recovery_vs_computation.png)
+
+![Budget reveal](../experiments/noise_study/results/animations/budget_reveal.gif)
+
+*The same data, built up in the order of the argument: single techniques, then
+injection + KLD, then the fixed-budget controls that explain it.*
 
 **ESS gating has no measurable effect on recovery.**
 - V6 − V3 = +1 pp (CI [−9, +11]).
@@ -362,6 +374,13 @@ kidnap; n = 100 each):
   not to make the typical estimate more accurate.
 
 **What the particle cloud does** (Figures 5 and 6).
+
+![Kidnap replay](../experiments/noise_study/results/animations/kidnap_replay.gif)
+
+*Seed 1000 replayed update by update to V1 and V8 with identical sensor data. The circle
+is each filter's own 95% credible region (drawn radius capped at 60 cm; the status line
+gives the exact value). V1 is falsely confident for the rest of the run. V8's cloud
+spreads after injection, then collapses onto the true pose.*
 
 ![Case trajectories](../experiments/noise_study/results/figures/05_case_trajectories.png)
 
@@ -445,6 +464,13 @@ These results are descriptive.
 ## 10. Global-localisation limitations
 
 ![Global diagnostic](../experiments/noise_study/results/figures/11_global_diagnostic.png)
+
+![Global sweep](../experiments/noise_study/results/animations/global_sweep.gif)
+
+*Seed 1000, a "hypothesis lost" case. With each of the 12 sweep readings, the likelihood
+of every possible start position is updated, and the plausible region shrinks to the true
+start. Meanwhile, V1's particles settle elsewhere: particle mass within 20 cm of the
+truth stays at 0.00.*
 
 **Global success is low for every variant.** Sustained convergence is 10–21%, e.g. V1
 20% [13, 29] and V2 21%. KLD reduces it slightly: K main effect −4.5 pp, CI [−8.8, −0.2].

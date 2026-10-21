@@ -44,6 +44,13 @@ And what do they cost in computation and closed-loop reliability?
 
 All three are reimplemented from the literature and ROS AMCL; none is new.
 
+![Two filters, same sensor data, through a kidnap](experiments/noise_study/results/animations/kidnap_replay.gif)
+
+*The same recorded run fed to two filters (seed 1000). After the robot is picked up and
+moved, the baseline (left) stays confidently wrong: a tight cloud, a small confidence
+circle, and 35 cm of error. Injection + KLD (right) spreads its particles, then recovers
+to 1 cm.*
+
 ![Recovery vs computation](experiments/noise_study/results/figures/03_recovery_vs_computation.png)
 
 *Kidnap recovery (sustained < 10 cm) against filter CPU per trajectory and particle
@@ -76,8 +83,14 @@ fixed-budget controls.*
    are genuine sensor ambiguity. The other half are sampling failures, where the
    measurements identify the true start but the particle set never holds it.
 
+**Animations** (made with ManimGX from the saved results; MP4s alongside the GIFs):
+
+| Is it the technique or the particle budget? | How KLD-sampling picks a particle count | Global localisation: a valid hypothesis the particles miss |
+|---|---|---|
+| ![budget](experiments/noise_study/results/animations/budget_reveal.gif) | ![kld](experiments/noise_study/results/animations/kld_sampling.gif) | ![global](experiments/noise_study/results/animations/global_sweep.gif) |
+
 Full report: **[docs/noise_study.md](docs/noise_study.md)**
-- design, definitions and all 11 figures
+- design, definitions, all 11 figures and the 4 animations
 - statistics and threats to validity
 - the pre-registered protocol: [PROTOCOL.md](experiments/noise_study/PROTOCOL.md)
 - the original exploratory study: [legacy_v1/](experiments/noise_study/legacy_v1/)
@@ -109,7 +122,14 @@ cd experiments/noise_study
 python run_study.py all      # all simulation batches (~15 min, resumable)
 python analyze.py            # tables and intervals from saved results
 python make_figures.py       # figures from saved results
+
+python animations/prepare_data.py   # animation data from saved results
+python animations/render.py         # needs Python 3.13+ and pip install -e ".[animation]"
 ```
+
+Rendering the animations needs a working GPU driver, or Linux/WSL, where ManimGX falls
+back to CPU rendering. See
+[animations/README.md](experiments/noise_study/animations/README.md).
 
 The saved raw results are in the repository, so `analyze.py` and `make_figures.py` work
 without rerunning the simulations. See
